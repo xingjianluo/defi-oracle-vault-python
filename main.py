@@ -1,8 +1,7 @@
-from fastapi import FastAPI
+"""本地启动入口: uv run uvicorn main:app --reload"""
 
-app = FastAPI()
+from defi_oracle_vault.api import create_app
+from defi_oracle_vault.vault import VaultService
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+service = VaultService()
+app = create_app(service)
