@@ -5,7 +5,8 @@
 2. 摄入报价，其中包含过期/非正/离群/缺失等异常，观察可区分拒绝原因；
 3. 按价值存入、按份额提取，演示找零现金与守恒对账；
 4. 价格剧烈波动触发熔断，存款被拒、提取在价格有效时放行；
-5. 越权恢复被拒、条件不满足被拒、满足后由 admin 受控恢复。
+5. 越权恢复被拒、条件不满足被拒、满足后由 admin 受控恢复；
+6. 历史回看：过去某时点的聚合价/持仓回放/对账（只读，不泄漏未来）。
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from defi_oracle_vault.errors import (
     CircuitOpen,
     InsufficientShares,
     InsufficientValidSources,
+    InvalidTimestamp,
     RecoveryConditionsNotMet,
     UnauthorizedRecovery,
 )
@@ -115,6 +117,23 @@ def main() -> None:
     feed(400, {"binance": "120", "chainlink": "121"})
     st = svc.recover_circuit("admin", "BTC", now=400)
     print("人工恢复后:", st.state.value)
+
+    banner("6) 历史回看：当时的价格/持仓/对账（只读，不泄漏未来）")
+    r = svc.price_of_at("BTC", 0, now=400)
+    print(f"ts=0 的聚合价={r.price} 采用={r.used_sources}（后来的 120 不会倒灌）")
+    print("当时拒绝明细:", [(x.source, x.reason_code) for x in r.rejected])
+    v = svc.position_at("alice", "BTC", 0, now=400)
+    print(f"alice 在 ts=0: 份额={v['shares']} NAV={v['nav']} 市值={v['value']}")
+    v = svc.position_at("carol", "BTC", 0, now=400)
+    print(f"carol 在 ts=0: has_position={v['has_position']}（当时还没建仓，不硬凑数字）")
+    rec = svc.reconcile_position("alice", "BTC", 0, now=400)
+    print("对账: 当时份额 + 之后净变动 =",
+          rec["shares_at"], "+", rec["net_change_after"],
+          "== 当前", rec["current_shares"], "->", rec["matches"])
+    try:
+        svc.price_of_at("BTC", 999999, now=400)
+    except InvalidTimestamp as e:
+        print("未来时点被拒:", e)
 
 
 if __name__ == "__main__":

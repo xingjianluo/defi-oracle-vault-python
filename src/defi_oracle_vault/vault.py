@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from decimal import ROUND_DOWN, Decimal, localcontext
@@ -26,10 +27,11 @@ from .errors import (
     CircuitOpen,
     InsufficientShares,
     InvalidAmount,
+    InvalidTimestamp,
     UnknownAsset,
 )
 from .ledger import Ledger
-from .models import AggregationResult, AssetConfig, OperationReceipt, Quote
+from .models import AggregationResult, AssetConfig, HistoryRetention, OperationReceipt, Quote
 from .pricing import PriceAggregator, PriceBook
 
 logger = logging.getLogger(__name__)
@@ -38,17 +40,19 @@ ZERO = Decimal(0)
 
 
 class VaultService:
-    """对外门面：配置资产、摄入价格、存取份额、查询估值、恢复熔断。"""
+    """对外门面：配置资产、摄入价格、存取份额、查询估值、恢复熔断、历史回看。"""
 
     def __init__(
         self,
         share_scale: int = 18,
         cash_scale: int = 8,
         operators: frozenset[str] | None = None,
+        quote_retention: HistoryRetention | None = None,
+        ledger_history_max_events: int | None = None,
     ) -> None:
-        self.book = PriceBook()
+        self.book = PriceBook(retention=quote_retention)
         self.aggregator = PriceAggregator(self.book)
-        self.ledger = Ledger(share_scale=share_scale)
+        self.ledger = Ledger(share_scale=share_scale, history_max_events=ledger_history_max_events)
         self.risk = RiskMonitor(operators=operators)
         self._configs: dict[str, AssetConfig] = {}
         # asset -> user -> 计价货币找零余额
@@ -96,6 +100,8 @@ class VaultService:
         if not price.is_finite():
             raise InvalidAmount(f"报价必须有限: {value}")
         quote_ts = time.monotonic() if ts is None else float(ts)
+        if not math.isfinite(quote_ts):
+            raise InvalidAmount(f"报价时间戳必须有限: {ts}")
         self.book.ingest(
             Quote(asset=asset, source=source, value=price, ts=quote_ts)
         )
@@ -144,6 +150,113 @@ class VaultService:
                 "ts": result.computed_ts,
             }
 
+    # ---- 历史回看（只读：不改熔断状态、不录观察样本、不动账本与现金） ----
+
+    def price_of_at(
+        self, asset: str, ts: float, now: float | None = None
+    ) -> AggregationResult:
+        """回看过去某时点的有效聚合价（只读、可重复）。
+
+        - 只用 ts 时点（含）之前已存在的报价，绝不使用更晚的报价；
+        - 判定口径与当前聚合完全一致（过期/非正/离群/最少来源数）；
+        - 该时点无报价(missing)与报价已被清理(pruned)是可区分的拒绝原因；
+        - 有效来源不足抛 InsufficientValidSources，从不观测抛 NoPriceObservation，
+          绝不拿更早或更晚的价格顶替；
+        - ts 非法（非有限/负数/晚于 now）抛 InvalidTimestamp。
+        """
+        config = self.get_config(asset)
+        self._check_query_ts(ts, time.monotonic() if now is None else now)
+        result = self.aggregator.evaluate_as_of(config, float(ts))
+        logger.info(
+            "price_of_at asset=%s ts=%s price=%s used=%s",
+            asset, ts, result.price, result.used_sources,
+        )
+        return result
+
+    def position_at(
+        self, user: str, asset: str, ts: float, now: float | None = None
+    ) -> dict:
+        """回放某用户在过去某时点的持仓：份额余额 + 按当时聚合价折算的市值。
+
+        只读、可重复：不改动账本、现金、熔断状态与观察样本。
+        - 资产在该时点不可用：抛 NoPriceObservation / InsufficientValidSources
+          （与"用户当时还没持仓"是可区分的两种结论）；
+        - 用户当时还没持仓：has_position=False 且 shares=0（不硬凑数字）；
+        - 账本历史被压实：抛 LedgerHistoryPruned。
+        """
+        config = self.get_config(asset)
+        self._check_query_ts(ts, time.monotonic() if now is None else now)
+        with self._lock:
+            result = self.aggregator.evaluate_as_of(config, float(ts))
+            shares = self.ledger.balance_at(asset, user, float(ts))
+            has_position = self.ledger.has_position_at(asset, user, float(ts))
+            with localcontext() as ctx:
+                ctx.prec = 60
+                value = shares * result.price
+            snapshot = {
+                "user": user,
+                "asset": asset,
+                "ts": float(ts),
+                "shares": shares,
+                "has_position": has_position,
+                "nav": result.price,
+                "value": value,
+                "used_sources": result.used_sources,
+                "rejected": result.rejected,
+            }
+        logger.info(
+            "position_at user=%s asset=%s ts=%s shares=%s has_position=%s nav=%s value=%s",
+            user, asset, ts, shares, has_position, result.price, value,
+        )
+        return snapshot
+
+    def reconcile_position(
+        self, user: str, asset: str, ts: float, now: float | None = None
+    ) -> dict:
+        """历史时点与当前持仓对账（只读）。
+
+        恒等式：当前份额 == 历史时点份额 + 之后存入合计 - 之后提取合计。
+        返回净变动明细，差额可逐笔解释；matches=False 表示账本内部不一致。
+        """
+        self.get_config(asset)
+        self._check_query_ts(ts, time.monotonic() if now is None else now)
+        with self._lock:
+            shares_at = self.ledger.balance_at(asset, user, float(ts))
+            deposited, withdrawn, events = self.ledger.net_change_after(
+                asset, user, float(ts)
+            )
+            current = self.ledger.balance_of(asset, user)
+        expected = shares_at + deposited - withdrawn
+        report = {
+            "user": user,
+            "asset": asset,
+            "ts": float(ts),
+            "shares_at": shares_at,
+            "deposited_after": deposited,
+            "withdrawn_after": withdrawn,
+            "net_change_after": deposited - withdrawn,
+            "events_after": events,
+            "current_shares": current,
+            "expected_current": expected,
+            "matches": current == expected,
+        }
+        logger.info("reconcile_position %s", report)
+        return report
+
+    @staticmethod
+    def _check_query_ts(ts: float, now: float) -> None:
+        """校验历史查询时点：必须有限、非负且不晚于参考时刻 now。"""
+        try:
+            value = float(ts)
+        except (TypeError, ValueError):
+            raise InvalidTimestamp(ts, "时间点必须是数值") from None
+        if not math.isfinite(value):
+            raise InvalidTimestamp(ts, "时间点必须有限")
+        if value < 0:
+            raise InvalidTimestamp(ts, "时间点不能为负")
+        if value > now:
+            raise InvalidTimestamp(ts, f"时间点晚于当前参考时刻 {now}（不允许查询未来）")
+
     # ---- 份额存取 ----
 
     def deposit(
@@ -159,7 +272,7 @@ class VaultService:
             ts = time.monotonic() if now is None else now
             self.risk.ensure_not_open(asset)
             result = self._resolve_price(asset, ts)
-            self.ledger.deposit(asset, user, shares)
+            self.ledger.deposit(asset, user, shares, ts=ts, kind="deposit")
             return self._receipt("deposit", user, asset, shares, result)
 
     def deposit_value(
@@ -194,7 +307,7 @@ class VaultService:
                 cash = change.quantize(cash_quantum, rounding=ROUND_DOWN)
                 cash_residual = change - cash
 
-            self.ledger.deposit(asset, user, shares)
+            self.ledger.deposit(asset, user, shares, ts=ts, kind="deposit_value")
             cashbook = self._cash[asset]
             cashbook[user] = cashbook.get(user, ZERO) + cash
             self._cash_dust[asset] += cash_residual
@@ -222,7 +335,7 @@ class VaultService:
             ts = time.monotonic() if now is None else now
             result = self._resolve_price(asset, ts)
             # 先估值后扣账：余额不足直接失败，账本无任何变化
-            self.ledger.withdraw(asset, user, shares)
+            self.ledger.withdraw(asset, user, shares, ts=ts, kind="withdraw")
             return self._receipt("withdraw", user, asset, shares, result)
 
     def cash_balance(self, user: str, asset: str) -> Decimal:

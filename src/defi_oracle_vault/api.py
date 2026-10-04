@@ -12,6 +12,9 @@
 - GET  /users/{user}/positions/{asset} 持仓估值
 - POST /assets/{asset}/cash/withdraw 提走找零现金
 - GET  /assets/{asset}/audit         守恒对账
+- GET  /assets/{asset}/price/history?ts=           历史时点聚合价（只读回看）
+- GET  /users/{user}/positions/{asset}/history?ts= 历史时点持仓回放（只读）
+- GET  /users/{user}/positions/{asset}/reconcile?ts= 历史时点与当前持仓对账
 - GET  /health                       健康检查
 
 业务错误统一返回 4xx 与明确 error_code，失败语义可区分。
@@ -32,6 +35,8 @@ from .errors import (
     InsufficientShares,
     InsufficientValidSources,
     InvalidAmount,
+    InvalidTimestamp,
+    LedgerHistoryPruned,
     NoPriceObservation,
     RecoveryConditionsNotMet,
     UnauthorizedRecovery,
@@ -55,6 +60,8 @@ _STATUS: dict[type[Exception], int] = {
     UnauthorizedRecovery: 403,
     RecoveryConditionsNotMet: 409,
     InvalidAmount: 422,
+    InvalidTimestamp: 422,
+    LedgerHistoryPruned: 410,
 }
 
 
@@ -232,6 +239,55 @@ def create_app(service: VaultService | None = None) -> FastAPI:
                 for r in v["rejected"]
             ],
             "ts": v["ts"],
+        }
+
+    @app.get("/assets/{asset}/price/history")
+    def price_history(asset: str, ts: float):
+        result = svc.price_of_at(asset, ts)
+        return {
+            "asset": asset,
+            "price": str(result.price),
+            "used_sources": list(result.used_sources),
+            "rejected": [
+                {"source": r.source, "reason_code": r.reason_code, "detail": r.detail}
+                for r in result.rejected
+            ],
+            "computed_ts": result.computed_ts,
+        }
+
+    @app.get("/users/{user}/positions/{asset}/history")
+    def position_history(user: str, asset: str, ts: float):
+        v = svc.position_at(user, asset, ts)
+        return {
+            "user": user,
+            "asset": asset,
+            "ts": v["ts"],
+            "shares": str(v["shares"]),
+            "has_position": v["has_position"],
+            "nav": str(v["nav"]),
+            "value": str(v["value"]),
+            "used_sources": list(v["used_sources"]),
+            "rejected": [
+                {"source": r.source, "reason_code": r.reason_code, "detail": r.detail}
+                for r in v["rejected"]
+            ],
+        }
+
+    @app.get("/users/{user}/positions/{asset}/reconcile")
+    def position_reconcile(user: str, asset: str, ts: float):
+        r = svc.reconcile_position(user, asset, ts)
+        return {
+            "user": r["user"],
+            "asset": r["asset"],
+            "ts": r["ts"],
+            "shares_at": str(r["shares_at"]),
+            "deposited_after": str(r["deposited_after"]),
+            "withdrawn_after": str(r["withdrawn_after"]),
+            "net_change_after": str(r["net_change_after"]),
+            "events_after": r["events_after"],
+            "current_shares": str(r["current_shares"]),
+            "expected_current": str(r["expected_current"]),
+            "matches": r["matches"],
         }
 
     @app.get("/assets/{asset}/audit")

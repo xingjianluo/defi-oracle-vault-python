@@ -22,6 +22,40 @@ class Quote:
 
 
 @dataclass(frozen=True)
+class HistoryRetention:
+    """历史报价保留策略（有界，防止无限占内存）。
+
+    按 (资产, 来源) 序列独立执行，摄入时滚动清理：
+    - max_age_seconds: 只保留与该序列最新报价时间差不超过该值的条目
+      （边界含等号：newest_ts - entry.ts <= max_age_seconds 即保留）；
+      None 表示不按年龄清理。
+    - max_entries_per_source: 每个序列最多保留的条数（超出时丢弃最旧的）；
+      None 表示不按条数清理。
+    两者同时配置时同时生效（任一条件触发即清理）。
+    注意：被清理不等于"当时没有报价"——每个序列的最早观测时间
+    会被永久记住，用于区分两种结论。
+    """
+
+    max_age_seconds: float | None = 3600.0
+    max_entries_per_source: int | None = 10000
+
+
+@dataclass(frozen=True)
+class ShareEvent:
+    """一次份额变动事件（账本回放用，追加式不可变）。
+
+    seq 为全局单调序号，用于相同 ts 下的确定性排序（先发生先回放）。
+    delta 为正表示存入、为负表示提取。
+    """
+
+    seq: int
+    ts: float
+    user: str
+    delta: Decimal
+    kind: str  # deposit / deposit_value / withdraw
+
+
+@dataclass(frozen=True)
 class SourceRejection:
     """一条来源被拒绝的可解释记录。"""
 

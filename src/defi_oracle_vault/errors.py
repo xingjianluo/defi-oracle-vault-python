@@ -87,6 +87,13 @@ class NoPriceObservation(PriceFeedError):
         super().__init__(f"资产 {asset!r} 从无价格观测")
 
 
+class QuotePruned(QuoteRejected):
+    """该来源在查询时点之前确有报价，但已超出保留窗口被清理（与"当时无报价"可区分）。"""
+
+    def __init__(self, source: str, detail: str) -> None:
+        super().__init__(source, f"历史报价已超出保留范围被清理({detail})")
+
+
 # ---- 估值相关 ----
 
 
@@ -101,6 +108,15 @@ class AssetUnavailable(ValuationError):
         self.asset = asset
         self.detail = detail
         super().__init__(f"资产 {asset!r} 当前不可用: {detail}")
+
+
+class InvalidTimestamp(ValuationError):
+    """历史查询时间点非法（非有限数、负数或落在未来）。"""
+
+    def __init__(self, ts: object, detail: str) -> None:
+        self.ts = ts
+        self.detail = detail
+        super().__init__(f"非法查询时间点 {ts!r}: {detail}")
 
 
 # ---- 账本 / 份额操作相关 ----
@@ -130,6 +146,19 @@ class InsufficientShares(LedgerError):
         self.requested = requested
         self.available = available
         super().__init__(f"用户 {user!r} 份额不足: 请求={requested}, 可用={available}")
+
+
+class LedgerHistoryPruned(LedgerError):
+    """账本历史事件已被压实清理，无法精确回放到该时点（与"当时无持仓"可区分）。"""
+
+    def __init__(self, asset: str, ts: float, horizon: float) -> None:
+        self.asset = asset
+        self.ts = ts
+        self.horizon = horizon
+        super().__init__(
+            f"资产 {asset!r} 在 ts={ts} 的账本历史已被压实"
+            f"(可回放边界 horizon={horizon})"
+        )
 
 
 # ---- 熔断 / 风控相关 ----
