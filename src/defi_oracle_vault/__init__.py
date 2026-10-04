@@ -1,11 +1,15 @@
 """本地资产库系统：多源价格聚合、份额存取、风控熔断。"""
 
+from .circuit import RiskMonitor
 from .errors import (
     AssetUnavailable,
     CircuitOpen,
+    HistoryOutOfRetention,
     InsufficientShares,
     InsufficientValidSources,
     InvalidAmount,
+    InvalidHistoryQuery,
+    NoPositionAtTime,
     NoPriceObservation,
     QuoteExpired,
     QuoteMissing,
@@ -22,28 +26,38 @@ from .models import (
     AssetConfig,
     CircuitState,
     CircuitStatus,
+    HistoricalAggregationResult,
+    HistoricalPosition,
+    LedgerEvent,
     OperationReceipt,
+    PositionReconciliation,
     Quote,
     SourceRejection,
     TriggerEvidence,
 )
 from .pricing import PriceAggregator, PriceBook
-from .circuit import RiskMonitor
 from .vault import VaultService
 
 __all__ = [
-    "AssetConfig",
     "AggregationResult",
+    "AssetConfig",
     "AssetUnavailable",
     "CircuitOpen",
     "CircuitState",
     "CircuitStatus",
+    "HistoricalAggregationResult",
+    "HistoricalPosition",
+    "HistoryOutOfRetention",
     "InsufficientShares",
     "InsufficientValidSources",
     "InvalidAmount",
+    "InvalidHistoryQuery",
     "Ledger",
+    "LedgerEvent",
+    "NoPositionAtTime",
     "NoPriceObservation",
     "OperationReceipt",
+    "PositionReconciliation",
     "PriceAggregator",
     "PriceBook",
     "Quote",

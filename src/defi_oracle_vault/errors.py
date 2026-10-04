@@ -163,3 +163,44 @@ class RecoveryConditionsNotMet(CircuitBreakerError):
         self.asset = asset
         self.reasons = reasons
         super().__init__(f"资产 {asset!r} 恢复条件不满足: {'; '.join(reasons)}")
+
+
+# ---- 历史回看相关 ----
+
+
+class HistoryError(VaultError):
+    """历史回看查询相关失败基类。"""
+
+
+class InvalidHistoryQuery(HistoryError):
+    """历史查询入参非法（时间点非有限数等），请求方必须能与业务不可用区分。"""
+
+
+class HistoryOutOfRetention(HistoryError):
+    """查询时点早于该资产的历史留存下界，数据已按留存策略淘汰，无法回答。
+
+    与 NoPriceObservation（该时点当时确实还没有任何报价）是两种结论：
+    前者是"查不到/已淘汰"，后者是"留存可覆盖且当时确无报价"。
+    """
+
+    def __init__(self, asset: str, queried_ts: float, horizon_ts: float | None) -> None:
+        self.asset = asset
+        self.queried_ts = queried_ts
+        self.horizon_ts = horizon_ts
+        super().__init__(
+            f"资产 {asset!r} 的历史查询时点 {queried_ts} 已超出留存范围 "
+            f"(留存下界={horizon_ts})，该时点结论不可复现"
+        )
+
+
+class NoPositionAtTime(HistoryError):
+    """用户在该历史时点之前没有发生过任何份额变动（当时尚无持仓）。
+
+    与"资产当时不可用"严格区分：无持仓是用户维度事实，不依赖价格。
+    """
+
+    def __init__(self, user: str, asset: str, ts: float) -> None:
+        self.user = user
+        self.asset = asset
+        self.ts = ts
+        super().__init__(f"用户 {user!r} 在 {ts} 时尚无资产 {asset!r} 的持仓记录")

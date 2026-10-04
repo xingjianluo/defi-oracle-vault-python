@@ -16,8 +16,11 @@ from decimal import Decimal as D
 from defi_oracle_vault.errors import (
     AssetUnavailable,
     CircuitOpen,
+    HistoryOutOfRetention,
     InsufficientShares,
     InsufficientValidSources,
+    NoPositionAtTime,
+    NoPriceObservation,
     RecoveryConditionsNotMet,
     UnauthorizedRecovery,
 )
@@ -115,6 +118,31 @@ def main() -> None:
     feed(400, {"binance": "120", "chainlink": "121"})
     st = svc.recover_circuit("admin", "BTC", now=400)
     print("人工恢复后:", st.state.value)
+
+    banner("6) 历史回看：时点聚合价、持仓回放、与当前对账（只读）")
+    # 回看早期时点：只用当时已存在的报价，不泄漏后面 400 的价格
+    for t in (0, 50):
+        try:
+            h = svc.historical_price("BTC", t)
+            rejected = [(r.source, r.reason_code) for r in h.rejected]
+            print(f"t={t}: 聚合价={h.price} 采用={h.used_sources} 拒绝={rejected}")
+        except (
+            NoPriceObservation,
+            HistoryOutOfRetention,
+            InsufficientValidSources,
+        ) as e:
+            print(f"t={t}: {type(e).__name__}: {e}")
+    # 持仓回放 + 与当前对账
+    try:
+        pos = svc.historical_position("alice", "BTC", 0)
+        print(f"alice@t=0: 份额={pos.shares} 当时价={pos.price} 市值={pos.value}")
+        rec = svc.reconcile_position("alice", "BTC", 0)
+        print(
+            f"对账: 历史={rec.historical_shares} + 净变化={rec.net_delta} "
+            f"== 当前={rec.current_shares} ? {rec.matches}；区间事件数={len(rec.events)}"
+        )
+    except NoPositionAtTime as e:
+        print(type(e).__name__, e)
 
 
 if __name__ == "__main__":

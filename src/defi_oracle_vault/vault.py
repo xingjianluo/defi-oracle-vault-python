@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from decimal import ROUND_DOWN, Decimal, localcontext
@@ -23,13 +24,22 @@ from decimal import ROUND_DOWN, Decimal, localcontext
 from .circuit import RiskMonitor
 from .errors import (
     AssetUnavailable,
-    CircuitOpen,
     InsufficientShares,
     InvalidAmount,
+    InvalidHistoryQuery,
+    NoPositionAtTime,
     UnknownAsset,
 )
 from .ledger import Ledger
-from .models import AggregationResult, AssetConfig, OperationReceipt, Quote
+from .models import (
+    AggregationResult,
+    AssetConfig,
+    HistoricalAggregationResult,
+    HistoricalPosition,
+    OperationReceipt,
+    PositionReconciliation,
+    Quote,
+)
 from .pricing import PriceAggregator, PriceBook
 
 logger = logging.getLogger(__name__)
@@ -45,8 +55,13 @@ class VaultService:
         share_scale: int = 18,
         cash_scale: int = 8,
         operators: frozenset[str] | None = None,
+        quote_retention_seconds: float | None = 3600.0,
+        max_quotes_per_source: int | None = 1000,
     ) -> None:
-        self.book = PriceBook()
+        self.book = PriceBook(
+            retention_seconds=quote_retention_seconds,
+            max_quotes_per_source=max_quotes_per_source,
+        )
         self.aggregator = PriceAggregator(self.book)
         self.ledger = Ledger(share_scale=share_scale)
         self.risk = RiskMonitor(operators=operators)
@@ -144,6 +159,90 @@ class VaultService:
                 "ts": result.computed_ts,
             }
 
+    # ---- 历史回看（纯只读：不改熔断状态、风控样本、账本与现金） ----
+
+    @staticmethod
+    def _check_hist_ts(ts: float) -> float:
+        t = float(ts)
+        if math.isnan(t) or math.isinf(t):
+            raise InvalidHistoryQuery(f"历史查询时点必须为有限数, 收到 {ts!r}")
+        return t
+
+    def historical_price(
+        self, asset: str, ts: float
+    ) -> HistoricalAggregationResult:
+        """回放 ts 时点的有效聚合价与完整判定依据（used/rejected 逐条可解释）。
+
+        - 只用 ts 当时已经存在的报价（ts' <= ts），绝不拿更晚报价倒推；
+        - 只读：不调用风控，不改变熔断状态与波动观察样本，重复查询结果一致；
+        - 失败语义可区分：
+          * InvalidHistoryQuery：入参非法；
+          * HistoryOutOfRetention：时点早于留存下界（数据已淘汰）；
+          * NoPriceObservation：留存可覆盖，但当时确实没有任何报价；
+          * InsufficientValidSources：当时有效来源不足，明确不可用。
+        """
+        t = self._check_hist_ts(ts)
+        config = self.get_config(asset)
+        return self.aggregator.evaluate_at(config, t)
+
+    def historical_position(
+        self, user: str, asset: str, ts: float
+    ) -> HistoricalPosition:
+        """回放用户在 ts 时点的份额余额与按当时聚合价计算的持仓市值。
+
+        纯只读、可重复，不触碰当前账本、现金与熔断。无持仓（ts 前没有任何
+        份额变动）抛 NoPositionAtTime；资产当时不可用的异常原样向上传播，
+        两种结论互不混淆。
+        """
+        t = self._check_hist_ts(ts)
+        config = self.get_config(asset)
+        shares, had_position = self.ledger.balance_at(asset, user, t)
+        if not had_position:
+            raise NoPositionAtTime(user, asset, t)
+        result = self.aggregator.evaluate_at(config, t)
+        with localcontext() as ctx:
+            ctx.prec = 60
+            value = shares * result.price
+        logger.info(
+            "historical_position user=%s asset=%s ts=%s shares=%s price=%s value=%s used=%s",
+            user, asset, t, shares, result.price, value, result.used_sources,
+        )
+        return HistoricalPosition(
+            user=user,
+            asset=asset,
+            queried_ts=t,
+            shares=shares,
+            price=result.price,
+            value=value,
+            used_sources=result.used_sources,
+            rejected=result.rejected,
+        )
+
+    def reconcile_position(
+        self,
+        user: str,
+        asset: str,
+        historical_ts: float,
+        current_ts: float | None = None,
+    ) -> PositionReconciliation:
+        """历史份额与当前份额对账（纯只读）。
+
+        恒等式：current_shares == historical_shares + net_delta，
+        net_delta 为 (historical_ts, current_ts] 内该用户全部存取的净变化，
+        events 逐笔给出，差额可解释。matches=False 即为对账不平。
+        current_ts 缺省取该用户事件流最新时间。
+        """
+        t = self._check_hist_ts(historical_ts)
+        self.get_config(asset)
+        rec = self.ledger.reconcile(asset, user, t, current_ts)
+        logger.info(
+            "reconcile_position user=%s asset=%s hist_ts=%s hist=%s current=%s "
+            "net_delta=%s matches=%s events=%d",
+            user, asset, t, rec.historical_shares, rec.current_shares,
+            rec.net_delta, rec.matches, len(rec.events),
+        )
+        return rec
+
     # ---- 份额存取 ----
 
     def deposit(
@@ -159,7 +258,7 @@ class VaultService:
             ts = time.monotonic() if now is None else now
             self.risk.ensure_not_open(asset)
             result = self._resolve_price(asset, ts)
-            self.ledger.deposit(asset, user, shares)
+            self.ledger.deposit(asset, user, shares, ts)
             return self._receipt("deposit", user, asset, shares, result)
 
     def deposit_value(
@@ -194,7 +293,7 @@ class VaultService:
                 cash = change.quantize(cash_quantum, rounding=ROUND_DOWN)
                 cash_residual = change - cash
 
-            self.ledger.deposit(asset, user, shares)
+            self.ledger.deposit(asset, user, shares, ts)
             cashbook = self._cash[asset]
             cashbook[user] = cashbook.get(user, ZERO) + cash
             self._cash_dust[asset] += cash_residual
@@ -222,7 +321,7 @@ class VaultService:
             ts = time.monotonic() if now is None else now
             result = self._resolve_price(asset, ts)
             # 先估值后扣账：余额不足直接失败，账本无任何变化
-            self.ledger.withdraw(asset, user, shares)
+            self.ledger.withdraw(asset, user, shares, ts)
             return self._receipt("withdraw", user, asset, shares, result)
 
     def cash_balance(self, user: str, asset: str) -> Decimal:

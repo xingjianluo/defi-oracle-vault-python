@@ -4,6 +4,9 @@
 - POST /assets/{asset}/configure     配置资产（来源、聚合与风控参数）
 - POST /assets/{asset}/quotes        摄入一条报价
 - GET  /assets/{asset}/price         当前聚合价与判定依据（含被拒来源）
+- GET  /assets/{asset}/history/price?ts= 历史时点聚合价（只读；410 越界/503 无报价或不可用/422 非法时点）
+- GET  /users/{user}/positions/{asset}/history?ts= 历史持仓回放（404 当时无持仓）
+- GET  /users/{user}/positions/{asset}/reconcile 历史份额与当前份额对账
 - GET  /assets/{asset}/circuit       熔断状态与触发依据
 - POST /assets/{asset}/recover       授权操作者手动恢复
 - POST /assets/{asset}/deposit       按份额存入
@@ -29,9 +32,12 @@ from pydantic import BaseModel
 from .errors import (
     AssetUnavailable,
     CircuitOpen,
+    HistoryOutOfRetention,
     InsufficientShares,
     InsufficientValidSources,
     InvalidAmount,
+    InvalidHistoryQuery,
+    NoPositionAtTime,
     NoPriceObservation,
     RecoveryConditionsNotMet,
     UnauthorizedRecovery,
@@ -55,6 +61,9 @@ _STATUS: dict[type[Exception], int] = {
     UnauthorizedRecovery: 403,
     RecoveryConditionsNotMet: 409,
     InvalidAmount: 422,
+    InvalidHistoryQuery: 422,
+    HistoryOutOfRetention: 410,  # Gone：历史数据已按留存策略淘汰
+    NoPositionAtTime: 404,
 }
 
 
@@ -166,6 +175,69 @@ def create_app(service: VaultService | None = None) -> FastAPI:
                 for r in result.rejected
             ],
             "computed_ts": result.computed_ts,
+        }
+
+    @app.get("/assets/{asset}/history/price")
+    def history_price(asset: str, ts: float):
+        """历史时点聚合价（只读）。
+
+        410 HistoryOutOfRetention：已超留存范围；503 NoPriceObservation：
+        留存可覆盖但当时确无报价；503 InsufficientValidSources：当时不可用。
+        """
+        h = svc.historical_price(asset, ts)
+        return {
+            "asset": asset,
+            "queried_ts": h.queried_ts,
+            "price": str(h.price),
+            "used_sources": list(h.used_sources),
+            "rejected": [
+                {"source": r.source, "reason_code": r.reason_code, "detail": r.detail}
+                for r in h.rejected
+            ],
+            "oldest_retained_ts": h.oldest_retained_ts,
+        }
+
+    @app.get("/users/{user}/positions/{asset}/history")
+    def history_position(user: str, asset: str, ts: float):
+        """历史时点持仓回放（只读）：份额 + 当时聚合价市值 + 判定依据。"""
+        p = svc.historical_position(user, asset, ts)
+        return {
+            "user": user,
+            "asset": asset,
+            "queried_ts": p.queried_ts,
+            "shares": str(p.shares),
+            "price": str(p.price),
+            "value": str(p.value),
+            "used_sources": list(p.used_sources),
+            "rejected": [
+                {"source": r.source, "reason_code": r.reason_code, "detail": r.detail}
+                for r in p.rejected
+            ],
+        }
+
+    @app.get("/users/{user}/positions/{asset}/reconcile")
+    def reconcile_position(user: str, asset: str, historical_ts: float, current_ts: float | None = None):
+        """历史份额与当前份额对账：current == historical + net_delta，逐笔可解释。"""
+        r = svc.reconcile_position(user, asset, historical_ts, current_ts)
+        return {
+            "user": user,
+            "asset": asset,
+            "historical_ts": r.historical_ts,
+            "current_ts": r.current_ts,
+            "historical_shares": str(r.historical_shares),
+            "current_shares": str(r.current_shares),
+            "net_delta": str(r.net_delta),
+            "matches": r.matches,
+            "events": [
+                {
+                    "seq": e.seq,
+                    "ts": e.ts,
+                    "kind": e.kind,
+                    "shares_delta": str(e.shares_delta),
+                    "balance_after": str(e.balance_after),
+                }
+                for e in r.events
+            ],
         }
 
     @app.get("/assets/{asset}/circuit")

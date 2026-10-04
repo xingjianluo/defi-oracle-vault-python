@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 
@@ -101,3 +101,68 @@ class OperationReceipt:
     ts: float
     balance_after: Decimal
     total_shares_after: Decimal
+
+
+@dataclass(frozen=True)
+class HistoricalAggregationResult:
+    """过去某一时点的聚合判定（只读回放结果）。
+
+    - queried_ts: 查询的历史时点；只使用 ts <= queried_ts 的报价（不泄漏未来）
+    - oldest_retained_ts: 该资产当前留存报价的最早时间（留存下界，审计用）；
+      None 表示从未有任何报价
+    - used_sources / rejected: 当时口径下的使用与拒绝明细，语义与实时聚合一致
+    """
+
+    asset: str
+    queried_ts: float
+    price: Decimal
+    used_sources: tuple[str, ...]
+    rejected: tuple[SourceRejection, ...]
+    oldest_retained_ts: float | None
+
+
+@dataclass(frozen=True)
+class LedgerEvent:
+    """一次份额变动的仅追加事件（带全局序号，同时点也有确定顺序）。"""
+
+    seq: int
+    ts: float
+    kind: str  # deposit / withdraw
+    user: str
+    asset: str
+    shares_delta: Decimal  # 带符号：存入为正、提取为负
+    balance_after: Decimal
+
+
+@dataclass(frozen=True)
+class HistoricalPosition:
+    """用户在某历史时点的份额余额与按当时聚合价计算的持仓市值。"""
+
+    user: str
+    asset: str
+    queried_ts: float
+    shares: Decimal
+    price: Decimal
+    value: Decimal
+    used_sources: tuple[str, ...]
+    rejected: tuple[SourceRejection, ...]
+
+
+@dataclass(frozen=True)
+class PositionReconciliation:
+    """历史份额与当前份额的对账结果。
+
+    恒等式：current_shares == historical_shares + net_delta，
+    其中 net_delta 为 (historical_ts, now] 区间内该用户全部份额变动之和；
+    events 给出每一笔可解释的净变化。
+    """
+
+    user: str
+    asset: str
+    historical_ts: float
+    current_ts: float
+    historical_shares: Decimal
+    current_shares: Decimal
+    net_delta: Decimal
+    matches: bool
+    events: tuple[LedgerEvent, ...]
