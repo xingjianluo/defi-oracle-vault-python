@@ -159,9 +159,14 @@ class VaultService:
 
         - 只用 ts 时点（含）之前已存在的报价，绝不使用更晚的报价；
         - 判定口径与当前聚合完全一致（过期/非正/离群/最少来源数）；
-        - 该时点无报价(missing)与报价已被清理(pruned)是可区分的拒绝原因；
-        - 有效来源不足抛 InsufficientValidSources，从不观测抛 NoPriceObservation，
-          绝不拿更早或更晚的价格顶替；
+        - 失败结论三种互不混淆，可分别捕获：
+          * NoPriceObservation：该资产从来没收到过报价；
+          * HistoryOutOfRetention：ts 早于回看边界 horizon（边界含等号，
+            即 ts<horizon 才算超出），曾有报价但已被保留策略清理，
+            异常带 horizon/required/retained_available/pruned_sources；
+          * InsufficientValidSources：在保留范围内，但当时无报价
+            （missing）、某来源从未报价、过期/非正/离群等，逐来源原因
+            见 rejected；绝不拿更早或更晚的价格顶替；
         - ts 非法（非有限/负数/晚于 now）抛 InvalidTimestamp。
         """
         config = self.get_config(asset)
@@ -173,14 +178,29 @@ class VaultService:
         )
         return result
 
+    def price_history_horizon(self, asset: str) -> float | None:
+        """该资产当前的历史回看边界（含等号）：ts >= 边界即可用保留数据判定。
+
+        返回 None 表示保留序列不足以在任何时点凑齐 min_valid_sources
+        （例如还没喂够来源）。边界随摄入与清理推进，只读。
+        对账方可先取边界：ts < 边界时再查历史价必然得到
+        HistoryOutOfRetention，无需再和"当时没有报价"做区分猜测。
+        """
+        config = self.get_config(asset)
+        return self.book.history_horizon(
+            config.asset, config.sources, config.min_valid_sources
+        )
+
     def position_at(
         self, user: str, asset: str, ts: float, now: float | None = None
     ) -> dict:
         """回放某用户在过去某时点的持仓：份额余额 + 按当时聚合价折算的市值。
 
         只读、可重复：不改动账本、现金、熔断状态与观察样本。
-        - 资产在该时点不可用：抛 NoPriceObservation / InsufficientValidSources
-          （与"用户当时还没持仓"是可区分的两种结论）；
+        - 资产在该时点不可用：抛 NoPriceObservation（从无报价）、
+          HistoryOutOfRetention（早于回看边界，报价已清理）或
+          InsufficientValidSources（保留范围内但当时来源不足/被拒）；
+          与"用户当时还没持仓"是可区分的两类结论；
         - 用户当时还没持仓：has_position=False 且 shares=0（不硬凑数字）；
         - 账本历史被压实：抛 LedgerHistoryPruned。
         """

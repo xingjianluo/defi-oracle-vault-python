@@ -38,7 +38,7 @@ src/defi_oracle_vault/
 ├── vault.py     # VaultService 门面：估值、存取、找零、对账、历史回看
 └── api.py       # FastAPI HTTP 服务（错误码可区分）
 scripts/demo.py  # 端到端演示
-tests/           # 聚合/账本/熔断/服务/并发/HTTP/历史回看测试（56 个）
+tests/           # 聚合/账本/熔断/服务/并发/HTTP/历史回看测试（63 个）
 ```
 
 ## 一、多价格源摄入与聚合
@@ -149,6 +149,38 @@ tests/           # 聚合/账本/熔断/服务/并发/HTTP/历史回看测试（
 查询时点之前确实没有报价（`missing`）vs 曾有报价但已被清理（`pruned`）。
 序列的最新一条永远保留，当前（实时）语义不受清理影响。
 
+**资产级回看边界（horizon）**：仅有来源级的 `pruned` 明细还不够——对账时
+只看 HTTP 状态码和错误标识仍分不清"数据被清理了"和"那个时间点没有报价"。
+因此系统在资产级额外给出一个**可单独识别、单独上报**的失败结论
+`HistoryOutOfRetention`（HTTP **410 Gone**）：
+
+> 回看边界 `horizon` = 各配置来源保留序列最早报价 ts 中
+> 第 `min_valid_sources` 小者（含等号）。
+> `ts >= horizon` 的查询一律走正常判定；**只有 `ts < horizon`** 才判为
+> "超出保留范围"。边界随摄入与清理**单调向前**推进。
+
+历史查询失败因此有**三种互不混淆**的结论：
+
+| 结论 | 异常 | HTTP | 含义 |
+|------|------|------|------|
+| 超出保留范围 | `HistoryOutOfRetention` | **410** | 查询时点曾有报价，但能凑齐最少来源数的保留序列都还没开始（数据已被清理）。响应体带 `ts`/`horizon`(含等号)/`required`/`retained_available`/`pruned_sources` 与逐来源拒绝明细 |
+| 当时没有报价 | `InsufficientValidSources` | 503 | 查询在保留范围内，但该时点来源不足：来源**当时尚未开始报价**或**从未报过价**（`missing`）、保留到的报价过期/非正/离群等。逐来源原因见 `rejected` |
+| 资产从无观测 | `NoPriceObservation` | 503 | 该资产**从来没有**收到过任何一条报价 |
+
+判定口径要点：
+
+- 查询时点**正好等于**某条保留报价的 ts：该报价正常可用（`ts <=` 含等号）；
+- 查询时点**正好等于 horizon**：按保留规则给出确定结论（正常判定，不报 410）；
+- 查询**早于该来源第一条报价**：即使该来源后来有报价并已被清理，也只记
+  `missing`（当时确实还没有），不算清理；
+- 同一来源同时踩中多个拒绝条件时，按固定管线顺序
+  （缺失/已清理 → 过期 → 非正数 → 离群）报告第一个，结论可复现；
+- 非法时间点（非数值、NaN/±inf、负数、未来）在进入保留判定前即抛
+  `InvalidTimestamp`（422），不会把请求打崩，也不产生飘忽结果。
+
+可在查询前用 `VaultService.price_history_horizon(asset)` 只读探知当前边界，
+对账方据此即可预知某时点会不会得到 410，无需再和 503 做猜测性区分。
+
 **账本历史**：`Ledger` 对每次存取追加不可变 `ShareEvent`（含全局单调序号，
 相同 ts 按发生顺序回放）。可选 `ledger_history_max_events` 上限：超出时把
 最旧事件**压实**进用户基线余额并推进回放边界 `horizon`；查询 `horizon`
@@ -163,12 +195,14 @@ ledger_history_max_events=...)`。
 - `price_of_at(asset, ts)`：过去某时点的有效聚合价。**只用 ts（含）之前
   已存在的报价**，绝不使用更晚的报价（不泄漏未来信息）；判定口径与当前
   聚合完全一致（过期/非正/离群/最少来源数，过期年龄相对 ts 计算）。
-  有效来源不足抛 `InsufficientValidSources`（拒绝明细含 `missing`/`pruned`
-  等可区分原因），从不观测抛 `NoPriceObservation`，**绝不拿更早或更晚的
-  价格顶替**。
+  失败给出三种互不混淆的结论：`HistoryOutOfRetention`（410，早于回看边界、
+  报价已清理）、`InsufficientValidSources`（503，保留范围内当时来源不足，
+  拒绝明细含 `missing`/`pruned`/`expired` 等逐来源原因）、
+  `NoPriceObservation`（503，资产从无报价），**绝不拿更早或更晚的价格顶替**；
+  `price_history_horizon(asset)` 可只读探知回看边界。
 - `position_at(user, asset, ts)`：回放该时点的份额余额与按当时聚合价折算的
-  市值。资产当时不可用（抛上述价格错误）与**用户当时还没持仓**
-  （正常返回 `has_position=false, shares=0`）是两种可区分结论，不硬凑数字。
+  市值。资产当时不可用（抛上述三种价格错误之一）与**用户当时还没持仓**
+  （正常返回 `has_position=false, shares=0`）是两类可区分结论，不硬凑数字。
 - `reconcile_position(user, asset, ts)`：历史与当前对账。恒等式
   `当前份额 == 历史时点份额 + 之后存入合计 − 之后提取合计`，
   返回净变动明细与事件数，差额可逐笔解释。
@@ -200,6 +234,8 @@ ledger_history_max_events=...)`。
 | 份额/现金不足 | `InsufficientShares` | 409 |
 | 金额非法（非正/超精度/非有限/折算为0） | `InvalidAmount` | 422 |
 | 历史查询时间点非法（非有限/负数/未来） | `InvalidTimestamp` | 422 |
+| 历史报价早于回看边界、已被保留策略清理 | `HistoryOutOfRetention`（带 `horizon` 等依据） | **410** |
+| 保留范围内当时来源不足（没报价/过期/被拒） | `InsufficientValidSources`（逐来源 `missing`/`pruned`/...） | 503 |
 | 账本历史已压实，无法回放到该时点 | `LedgerHistoryPruned` | 410 |
 | 越权恢复 | `UnauthorizedRecovery` | 403 |
 | 恢复条件不满足 | `RecoveryConditionsNotMet` | 409 |
@@ -250,25 +286,56 @@ ledger_history_max_events=...)`。
 ## 八、本地验证历史回看能力
 
 ```bash
-# 全部测试（含 tests/test_history.py 的 16 个历史回看用例，
-# 日志实时打印喂入价格与判定依据）
+# 全部测试（含 tests/test_history.py 的 23 个历史回看用例，
+# 日志实时打印喂入价格与判定依据，"超出保留范围"另打 WARNING 级
+# OUT_OF_RETENTION 行，含 ts/horizon/已清理来源）
 uv run pytest -q
 
-# 只看历史回看用例
+# 只看历史回看用例（覆盖：超出保留范围、保留边界含等号、条数上限边界、
+# 边界随摄入推进、无报价 vs 超出保留的区分、非法输入稳定、不泄漏未来、
+# 只读不污染、滚动保留下并发查询结论一致）
 uv run pytest tests/test_history.py -q
+uv run pytest tests/test_history.py -k retention -q   # 只看保留/边界相关
 
-# 命令行演示（末尾含历史回看段落）
+# 命令行演示（第 7 段现场对比 410 超出保留 / 503 当时无报价 / 503 从无观测）
 uv run python scripts/demo.py
 
-# HTTP 手动验证
+# HTTP 手动验证：410 与 503 的区别
 uv run uvicorn main:app &
-curl -X POST localhost:8000/assets/BTC/configure -H 'content-type: application/json' \
-  -d '{"sources":["s1","s2"],"min_valid_sources":2,"max_age_seconds":30}'
-curl -X POST localhost:8000/assets/BTC/quotes -H 'content-type: application/json' \
-  -d '{"source":"s1","value":"100","ts":1}'
-curl -X POST localhost:8000/assets/BTC/quotes -H 'content-type: application/json' \
-  -d '{"source":"s2","value":"100","ts":1}'
-curl 'localhost:8000/assets/BTC/price/history?ts=1'          # 历史聚合价
-curl 'localhost:8000/users/alice/positions/BTC/history?ts=1' # 历史持仓回放
-curl 'localhost:8000/users/alice/positions/BTC/reconcile?ts=1' # 历史对账
+curl -X POST localhost:8000/assets/ETH/configure -H 'content-type: application/json' \
+  -d '{"sources":["e1","e2"],"min_valid_sources":2,"max_age_seconds":1000}'
+for s in e1 e2; do
+  curl -X POST localhost:8000/assets/ETH/quotes -H 'content-type: application/json' \
+    -d "{\"source\":\"$s\",\"value\":\"2000\",\"ts\":0}"
+  curl -X POST localhost:8000/assets/ETH/quotes -H 'content-type: application/json' \
+    -d "{\"source\":\"$s\",\"value\":\"2100\",\"ts\":100}"   # 保留窗默认 3600s
+done
+# 注意：服务默认 quote_retention=max_age 3600；要观察 410 请用较短保留窗
+# 构造 VaultService(quote_retention=HistoryRetention(max_age_seconds=10))。
+# ts 早于 horizon -> 410 HistoryOutOfRetention（带 horizon 依据）；
+# ts 非负但早于第一条报价 -> 503 InsufficientValidSources（rejected 全 missing）。
+```
+
+### 三种失败结论的最小可复现对比（Python）
+
+```python
+from decimal import Decimal
+from defi_oracle_vault import (
+    VaultService, AssetConfig, HistoryRetention,
+    HistoryOutOfRetention, InsufficientValidSources, NoPriceObservation,
+)
+
+svc = VaultService(quote_retention=HistoryRetention(max_age_seconds=10))
+svc.configure(AssetConfig(asset="ETH", sources=("e1", "e2"),
+                          min_valid_sources=2, max_age_seconds=1000))
+for t, p in ((0.0, "2000"), (100.0, "2100")):
+    svc.ingest_quote("ETH", "e1", Decimal(p), t)
+    svc.ingest_quote("ETH", "e2", Decimal(p), t)
+
+svc.price_history_horizon("ETH")          # 100.0（边界含等号）
+svc.price_of_at("ETH", 100, now=200)      # OK：恰好等于边界报价
+try:
+    svc.price_of_at("ETH", 50, now=200)   # 早于边界 -> 410
+except HistoryOutOfRetention as e:
+    print(e.horizon, e.pruned_sources)    # 100.0 ('e1','e2')
 ```

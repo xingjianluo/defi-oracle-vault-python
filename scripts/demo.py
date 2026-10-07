@@ -17,13 +17,15 @@ from decimal import Decimal as D
 from defi_oracle_vault.errors import (
     AssetUnavailable,
     CircuitOpen,
+    HistoryOutOfRetention,
     InsufficientShares,
     InsufficientValidSources,
     InvalidTimestamp,
+    NoPriceObservation,
     RecoveryConditionsNotMet,
     UnauthorizedRecovery,
 )
-from defi_oracle_vault.models import AssetConfig
+from defi_oracle_vault.models import AssetConfig, HistoryRetention
 from defi_oracle_vault.vault import VaultService
 
 
@@ -134,6 +136,59 @@ def main() -> None:
         svc.price_of_at("BTC", 999999, now=400)
     except InvalidTimestamp as e:
         print("未来时点被拒:", e)
+
+    banner("7) 三种历史失败结论互不混淆：超出保留 / 当时无报价 / 从无观测")
+    # 独立资产 ETH，短保留窗，便于演示"数据已被清理"是可单独识别的结论
+    hist = VaultService(quote_retention=HistoryRetention(max_age_seconds=10.0))
+    hist.configure(
+        AssetConfig(
+            asset="ETH",
+            sources=("e1", "e2"),
+            min_valid_sources=2,
+            max_age_seconds=1000.0,
+            outlier_deviation=D("0.05"),
+        )
+    )
+    for t, p in ((0.0, "2000"), (100.0, "2100")):
+        hist.ingest_quote("ETH", "e1", D(p), t)
+        hist.ingest_quote("ETH", "e2", D(p), t)
+    print("当前回看边界 horizon(含等号) =", hist.price_history_horizon("ETH"))
+    print("边界上 ts=100 的聚合价 =", hist.price_of_at("ETH", 100, now=200).price)
+    try:
+        hist.price_of_at("ETH", 50, now=200)  # 早于边界：ts=0 的报价已清理
+    except HistoryOutOfRetention as e:
+        print(
+            f"超出保留范围: error_code=HistoryOutOfRetention(HTTP 410), "
+            f"ts={e.ts} < horizon={e.horizon}, 已清理来源={e.pruned_sources}"
+        )
+    # 给 ETH 人为留一个"观测起点之前"的非负查询点：先只喂 t=100/200
+    early = VaultService(quote_retention=HistoryRetention(max_age_seconds=10.0))
+    early.configure(
+        AssetConfig(
+            asset="ETH",
+            sources=("e1", "e2"),
+            min_valid_sources=2,
+            max_age_seconds=1000.0,
+            outlier_deviation=D("0.05"),
+        )
+    )
+    for t, p in ((100.0, "2000"), (200.0, "2100")):
+        early.ingest_quote("ETH", "e1", D(p), t)
+        early.ingest_quote("ETH", "e2", D(p), t)
+    try:
+        early.price_of_at("ETH", 50, now=300)  # 非负但比第一条报价还早
+    except InsufficientValidSources as e:
+        print("当时没有报价:", type(e).__name__, [
+            (r.source, type(r).__name__) for r in e.rejected
+        ])
+    unknown = VaultService(quote_retention=HistoryRetention(max_age_seconds=10.0))
+    unknown.configure(
+        AssetConfig(asset="DOGE", sources=("d1", "d2"), min_valid_sources=2)
+    )
+    try:
+        unknown.price_of_at("DOGE", 50, now=200)
+    except NoPriceObservation as e:
+        print("资产从未收到报价:", type(e).__name__, e)
 
 
 if __name__ == "__main__":

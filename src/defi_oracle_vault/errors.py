@@ -94,6 +94,52 @@ class QuotePruned(QuoteRejected):
         super().__init__(source, f"历史报价已超出保留范围被清理({detail})")
 
 
+class HistoryOutOfRetention(PriceFeedError):
+    """历史查询时点早于该资产的回看边界：足够数量来源的报价都已被清理。
+
+    这是一个**资产级、可单独上报**的失败结论，与下列结论明确区分：
+    - 该资产从未收到过任何报价 -> ``NoPriceObservation``；
+    - 查询时点比所有来源的第一条报价还早（当时确实没有报价），
+      或保留范围内报价过期/被拒导致有效来源不足 -> ``InsufficientValidSources``
+      （拒绝明细里逐来源给出 missing/expired/... 原因）。
+
+    属性：
+    - asset: 资产标识；
+    - ts: 查询时点；
+    - horizon: 回看边界（含等号）：ts >= horizon 的查询不属超出保留范围，
+      ts < horizon 才判为超出；
+    - required: 聚合所需最少有效来源数；
+    - available_series: 该时点尚有保留报价可用（未被清理）的来源数；
+    - pruned_sources: 在该时点之前确有报价、但已被清理的来源；
+    - rejected: 逐来源拒绝明细（QuotePruned/QuoteMissing），便于审计。
+    """
+
+    def __init__(
+        self,
+        asset: str,
+        ts: float,
+        horizon: float,
+        required: int,
+        available_series: int,
+        pruned_sources: tuple[str, ...],
+        rejected: list[QuoteRejected],
+    ) -> None:
+        self.asset = asset
+        self.ts = ts
+        self.horizon = horizon
+        self.required = required
+        self.available_series = available_series
+        self.pruned_sources = pruned_sources
+        self.rejected = rejected
+        reasons = "; ".join(f"{r.source}:{r.reason}" for r in rejected)
+        super().__init__(
+            f"资产 {asset!r} 在 ts={ts} 的历史报价已超出保留范围"
+            f"(回看边界 horizon={horizon}, 含等号; "
+            f"保留范围内可用来源 {available_series}/{required}, "
+            f"已清理来源={list(pruned_sources)}); 拒绝明细=[{reasons}]"
+        )
+
+
 # ---- 估值相关 ----
 
 

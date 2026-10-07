@@ -32,6 +32,7 @@ from pydantic import BaseModel
 from .errors import (
     AssetUnavailable,
     CircuitOpen,
+    HistoryOutOfRetention,
     InsufficientShares,
     InsufficientValidSources,
     InvalidAmount,
@@ -62,6 +63,7 @@ _STATUS: dict[type[Exception], int] = {
     InvalidAmount: 422,
     InvalidTimestamp: 422,
     LedgerHistoryPruned: 410,
+    HistoryOutOfRetention: 410,
 }
 
 
@@ -127,6 +129,18 @@ def create_app(service: VaultService | None = None) -> FastAPI:
                 break
         payload: dict = {"error_code": type(exc).__name__, "message": str(exc)}
         if isinstance(exc, InsufficientValidSources):
+            payload["rejected"] = [
+                {"source": r.source, "reason": type(r).__name__, "detail": r.reason}
+                for r in exc.rejected
+            ]
+        if isinstance(exc, HistoryOutOfRetention):
+            # 独立于 503 的"超出保留范围"结论：410 + 回看边界与逐来源依据
+            payload["ts"] = exc.ts
+            payload["horizon"] = exc.horizon
+            payload["horizon_inclusive"] = True
+            payload["required"] = exc.required
+            payload["retained_available"] = exc.available_series
+            payload["pruned_sources"] = list(exc.pruned_sources)
             payload["rejected"] = [
                 {"source": r.source, "reason": type(r).__name__, "detail": r.reason}
                 for r in exc.rejected

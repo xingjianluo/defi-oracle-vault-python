@@ -3,6 +3,7 @@
 from .errors import (
     AssetUnavailable,
     CircuitOpen,
+    HistoryOutOfRetention,
     InsufficientShares,
     InsufficientValidSources,
     InvalidAmount,
@@ -43,6 +44,7 @@ __all__ = [
     "CircuitOpen",
     "CircuitState",
     "CircuitStatus",
+    "HistoryOutOfRetention",
     "HistoryRetention",
     "InsufficientShares",
     "InsufficientValidSources",
