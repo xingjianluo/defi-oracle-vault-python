@@ -38,6 +38,7 @@ from .errors import (
     InvalidTimestamp,
     LedgerHistoryPruned,
     NoPriceObservation,
+    PriceHistoryPruned,
     RecoveryConditionsNotMet,
     UnauthorizedRecovery,
     UnknownAsset,
@@ -62,6 +63,7 @@ _STATUS: dict[type[Exception], int] = {
     InvalidAmount: 422,
     InvalidTimestamp: 422,
     LedgerHistoryPruned: 410,
+    PriceHistoryPruned: 410,
 }
 
 
@@ -126,11 +128,17 @@ def create_app(service: VaultService | None = None) -> FastAPI:
                 status = code
                 break
         payload: dict = {"error_code": type(exc).__name__, "message": str(exc)}
-        if isinstance(exc, InsufficientValidSources):
+        if isinstance(exc, (InsufficientValidSources, PriceHistoryPruned)):
             payload["rejected"] = [
                 {"source": r.source, "reason": type(r).__name__, "detail": r.reason}
                 for r in exc.rejected
             ]
+        if isinstance(exc, PriceHistoryPruned):
+            payload["query_ts"] = exc.ts
+            payload["horizon"] = exc.horizon
+            payload["pruned_sources"] = list(exc.pruned_sources)
+            payload["valid"] = exc.valid
+            payload["required"] = exc.required
         if isinstance(exc, CircuitOpen):
             payload["trigger"] = exc.trigger
         if isinstance(exc, RecoveryConditionsNotMet):

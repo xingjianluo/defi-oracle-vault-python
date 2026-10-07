@@ -60,7 +60,7 @@ class SourceRejection:
     """一条来源被拒绝的可解释记录。"""
 
     source: str
-    reason_code: str  # missing / expired / non_positive / outlier / unconfigured
+    reason_code: str  # missing / pruned / expired / non_positive / outlier / unconfigured
     detail: str
 
 

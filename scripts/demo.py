@@ -20,6 +20,7 @@ from defi_oracle_vault.errors import (
     InsufficientShares,
     InsufficientValidSources,
     InvalidTimestamp,
+    PriceHistoryPruned,
     RecoveryConditionsNotMet,
     UnauthorizedRecovery,
 )
@@ -130,6 +131,17 @@ def main() -> None:
     print("对账: 当时份额 + 之后净变动 =",
           rec["shares_at"], "+", rec["net_change_after"],
           "== 当前", rec["current_shares"], "->", rec["matches"])
+    # 喂一条超出默认保留窗(3600s)的老报价，它会随最新报价摄入被滚动清理
+    feed(100, {"binance": "90", "chainlink": "91", "coinbase": "90.5"})
+    feed(4000, {"binance": "120", "chainlink": "121"})  # 触发清理：4000-100 > 3600
+    try:
+        svc.price_of_at("BTC", 100, now=4000)
+    except PriceHistoryPruned as e:
+        print(
+            "超出保留范围被单独识别(HTTP 410):",
+            f"horizon={e.horizon}",
+            f"被清理来源={list(e.pruned_sources)}",
+        )
     try:
         svc.price_of_at("BTC", 999999, now=400)
     except InvalidTimestamp as e:

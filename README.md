@@ -38,7 +38,7 @@ src/defi_oracle_vault/
 ├── vault.py     # VaultService 门面：估值、存取、找零、对账、历史回看
 └── api.py       # FastAPI HTTP 服务（错误码可区分）
 scripts/demo.py  # 端到端演示
-tests/           # 聚合/账本/熔断/服务/并发/HTTP/历史回看测试（56 个）
+tests/           # 聚合/账本/熔断/服务/并发/HTTP/历史回看测试（60 个）
 ```
 
 ## 一、多价格源摄入与聚合
@@ -145,8 +145,27 @@ tests/           # 聚合/账本/熔断/服务/并发/HTTP/历史回看测试（
 | `max_age_seconds` | 3600 | 只保留与序列最新报价时间差 `<=` 该值的条目（边界含等号）；`None` 不按年龄清理 |
 | `max_entries_per_source` | 10000 | 每序列最多保留条数，超出丢弃最旧；`None` 不限 |
 
-每个序列的**最早观测时间**被永久记住，因此能区分两种结论：
-查询时点之前确实没有报价（`missing`）vs 曾有报价但已被清理（`pruned`）。
+每个序列的**最早观测时间**被永久记住，因此能区分三种彼此独立的结论：
+
+| 结论 | 含义 | 上报方式（历史查询） |
+|------|------|----------------------|
+| 超出保留范围 `pruned` | 查询时点之前**确曾有报价**，但已被滚动清理 | **独立异常 `PriceHistoryPruned`，HTTP 410 + 独立 error_code**；响应携带 `query_ts`、可回看边界 `horizon`、`pruned_sources` 与每条拒绝明细 |
+| 当时没有报价 `missing` | 查询时点在保留范围内，但该来源当时还没有任何报价 | 有效来源不足时随 `InsufficientValidSources`（HTTP 503）的 `rejected` 明细上报，原因码 `missing` |
+| 从未收到过报价 | 该资产（在该时点之前）连一条报价都没有 | `NoPriceObservation`（HTTP 503） |
+
+> 注意：`pruned` 与 `missing` **不会**被挤进同一个笼统的"不可用"结果里。
+> 只要有任一配置来源在查询时点之前曾报过价且已被清理、而有效来源又不足以
+> 聚合，历史查询就返回 410 `PriceHistoryPruned`；同一次失败的 `rejected`
+> 明细里仍能区分其它来源到底是 `missing` 还是 `expired` 等。
+
+**保留边界（判定确定、含等号）**：设某来源仍保留的最早一条报价时间为
+`earliest_retained`，查询时点为 `ts`——
+
+- `ts == earliest_retained`（正好卡在还能回看的最早边界）：该条报价**可用**，
+  按保留规则给出确定结论；
+- `ts` 恰好等于某条报价的时间：该报价参与判定（`q.ts <= ts`，含等号）；
+- 只有 `ts < earliest_retained`（且该时点之前确曾观测到报价）才判超出保留范围。
+
 序列的最新一条永远保留，当前（实时）语义不受清理影响。
 
 **账本历史**：`Ledger` 对每次存取追加不可变 `ShareEvent`（含全局单调序号，
@@ -163,9 +182,15 @@ ledger_history_max_events=...)`。
 - `price_of_at(asset, ts)`：过去某时点的有效聚合价。**只用 ts（含）之前
   已存在的报价**，绝不使用更晚的报价（不泄漏未来信息）；判定口径与当前
   聚合完全一致（过期/非正/离群/最少来源数，过期年龄相对 ts 计算）。
-  有效来源不足抛 `InsufficientValidSources`（拒绝明细含 `missing`/`pruned`
-  等可区分原因），从不观测抛 `NoPriceObservation`，**绝不拿更早或更晚的
-  价格顶替**。
+  失败按三种彼此独立的结论上报：
+  - **`PriceHistoryPruned`（HTTP 410）**：配置来源中确曾有报价，但已超出
+    保留范围被清理（携带 `horizon`/`pruned_sources`，对账时可直接据此判断
+    "这是清理导致的不可查"，而不是当时没行情）；
+  - **`InsufficientValidSources`（HTTP 503）**：在保留范围内，但当时来源
+    不足/全部被拒（拒绝明细含 `missing`/`expired`/`non_positive`/`outlier`）；
+  - **`NoPriceObservation`（HTTP 503）**：该资产在该时点之前从未收到过报价。
+
+  三种情况都**绝不拿更早或更晚的价格顶替**。
 - `position_at(user, asset, ts)`：回放该时点的份额余额与按当时聚合价折算的
   市值。资产当时不可用（抛上述价格错误）与**用户当时还没持仓**
   （正常返回 `has_position=false, shares=0`）是两种可区分结论，不硬凑数字。
@@ -179,11 +204,14 @@ ledger_history_max_events=...)`。
 
 - 历史查询**不改动**熔断状态、不录观察样本、不动账本与现金；
   同一时点反复查询结果一致（有单测断言）。
-- 价格簿与账本各自持锁，快照读取是原子的：持续写入新报价/存取的同时
-  并发跑历史查询，同一历史时点的结论不因写入而前后矛盾；
-  历史查询不持有服务级写锁路径上的长临界区，不会拖慢正常存取。
-- 边界行为有单测覆盖：查询时点恰好落在保留边界、恰好等于某条报价的 ts、
-  同一来源同时踩中多个拒绝条件（按管线顺序报告第一个）。
+- 价格簿的历史判定数据（各来源可用报价、被清理集合、未配置来源、观测事实）
+  在**单次持锁的原子快照** `as_of_view` 中一次取齐：持续写入新报价/存取的
+  同时并发跑历史查询，同一历史时点的异常类型、`horizon` 与拒绝明细不会在
+  请求之间漂移；历史查询走只读路径，不与正常存取争用服务级写锁临界区，
+  不会拖慢正常存取。
+- 边界行为有单测覆盖：查询时点恰好落在保留边界（边界含等号，报价可用）、
+  早于边界 1 个单位即 410、恰好等于某条报价的 ts、
+  同一来源同时踩中多个拒绝条件（按管线顺序报告第一个，结论可复现）。
 
 ### 兼容范围
 
@@ -196,6 +224,7 @@ ledger_history_max_events=...)`。
 |------|------|------|
 | 资产未注册 | `UnknownAsset` | 404 |
 | 无任何报价 / 有效来源不足 / 过期导致不可用 | `NoPriceObservation`、`InsufficientValidSources`、`AssetUnavailable` | 503 |
+| **历史报价超出保留范围（曾有报价但已被清理，区别于"当时无报价"）** | **`PriceHistoryPruned`**（附 `horizon`/`pruned_sources`/`rejected`） | **410** |
 | 熔断中新增存款 | `CircuitOpen` | 409 |
 | 份额/现金不足 | `InsufficientShares` | 409 |
 | 金额非法（非正/超精度/非有限/折算为0） | `InvalidAmount` | 422 |
@@ -203,7 +232,7 @@ ledger_history_max_events=...)`。
 | 账本历史已压实，无法回放到该时点 | `LedgerHistoryPruned` | 410 |
 | 越权恢复 | `UnauthorizedRecovery` | 403 |
 | 恢复条件不满足 | `RecoveryConditionsNotMet` | 409 |
-| 单条报价拒绝（可在 503 的 `rejected` 中查看） | `QuoteMissing/QuotePruned/QuoteExpired/QuoteNonPositive/QuoteOutlier` | — |
+| 单条报价拒绝（可在 503/410 响应的 `rejected` 中查看） | `QuoteMissing/QuotePruned/QuoteExpired/QuoteNonPositive/QuoteOutlier` | — |
 
 ## 六、配置项（AssetConfig）
 
@@ -250,25 +279,39 @@ ledger_history_max_events=...)`。
 ## 八、本地验证历史回看能力
 
 ```bash
-# 全部测试（含 tests/test_history.py 的 16 个历史回看用例，
-# 日志实时打印喂入价格与判定依据）
+# 全部测试（含 tests/test_history.py 的 20 个历史回看用例，
+# 覆盖超出保留范围、保留边界、missing/pruned/从无报价三区分、
+# 不泄漏未来、并发下结论一致；日志实时打印喂入价格与判定依据）
 uv run pytest -q
 
 # 只看历史回看用例
 uv run pytest tests/test_history.py -q
 
-# 命令行演示（末尾含历史回看段落）
+# 命令行演示（末尾含历史回看段落，含一次 410 PriceHistoryPruned 演示）
 uv run python scripts/demo.py
 
 # HTTP 手动验证
 uv run uvicorn main:app &
 curl -X POST localhost:8000/assets/BTC/configure -H 'content-type: application/json' \
   -d '{"sources":["s1","s2"],"min_valid_sources":2,"max_age_seconds":30}'
+# ts=1 的报价……
 curl -X POST localhost:8000/assets/BTC/quotes -H 'content-type: application/json' \
   -d '{"source":"s1","value":"100","ts":1}'
 curl -X POST localhost:8000/assets/BTC/quotes -H 'content-type: application/json' \
   -d '{"source":"s2","value":"100","ts":1}'
-curl 'localhost:8000/assets/BTC/price/history?ts=1'          # 历史聚合价
-curl 'localhost:8000/users/alice/positions/BTC/history?ts=1' # 历史持仓回放
-curl 'localhost:8000/users/alice/positions/BTC/reconcile?ts=1' # 历史对账
+# ……随后被 ts=100 的新报价挤出保留窗(max_age 默认 3600，这里用小窗口便于观察)
+curl -X POST localhost:8000/assets/BTC/quotes -H 'content-type: application/json' \
+  -d '{"source":"s1","value":"120","ts":100}'
+curl -X POST localhost:8000/assets/BTC/quotes -H 'content-type: application/json' \
+  -d '{"source":"s2","value":"120","ts":100}'
+curl -i 'localhost:8000/assets/BTC/price/history?ts=1'
+#   -> HTTP/1.1 410  {"error_code":"PriceHistoryPruned",
+#                     "query_ts":1.0,"horizon":100.0,
+#                     "pruned_sources":["s1","s2"], "rejected":[...]}
+#   对照：查从未到过的时点（且无清理发生）是 503 + QuoteMissing/InsufficientValidSources；
+#         查一个完全没配置过报价的资产是 503 + NoPriceObservation；
+#         ts 为负/非数值/未来是 422 + InvalidTimestamp。
+curl 'localhost:8000/assets/BTC/price/history?ts=100'   # 边界含等号：200，用 ts=100 的报价
+curl 'localhost:8000/users/alice/positions/BTC/history?ts=1' # 410（持仓回放同样独立上报）
+curl 'localhost:8000/users/alice/positions/BTC/reconcile?ts=1' # 历史对账（不依赖价格保留）
 ```

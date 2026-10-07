@@ -20,11 +20,13 @@ from __future__ import annotations
 import bisect
 import logging
 import threading
+from dataclasses import dataclass
 from decimal import Decimal, localcontext
 
 from .errors import (
     InsufficientValidSources,
     NoPriceObservation,
+    PriceHistoryPruned,
     QuoteExpired,
     QuoteMissing,
     QuoteNonPositive,
@@ -50,6 +52,24 @@ class _UnconfiguredSource(QuoteRejected):
 
 
 _REASON_CODE[_UnconfiguredSource] = "unconfigured"
+
+
+@dataclass(frozen=True)
+class _AsOfView:
+    """一次历史时点判定所需的全部信息（单次加锁原子采集，并发下不漂移）。
+
+    - quotes:        配置来源在 ts（含）之前最近的一条保留报价（无则 None）
+    - pruned:        该时点之前确有报价但已被清理的配置来源集合
+    - unconfigured:  在 ts（含）之前曾报过价的未配置来源（不泄漏未来信息）
+    - observed:      该资产在 ts（含）之前是否曾观测到任何报价
+    - horizons:      各配置来源仍保留的最早报价 ts（用于计算可回看边界）
+    """
+
+    quotes: dict[str, Quote | None]
+    pruned: frozenset[str]
+    unconfigured: frozenset[str]
+    observed: bool
+    horizons: dict[str, float]
 
 
 class PriceBook:
@@ -151,15 +171,63 @@ class PriceBook:
         self, asset: str, sources: tuple[str, ...], ts: float
     ) -> tuple[dict[str, Quote | None], frozenset[str]]:
         """原子地读取多来源在 ts 时点的可用报价与被清理来源集合。"""
+        view = self.as_of_view(asset, sources, ts)
+        return view.quotes, view.pruned
+
+    def as_of_view(
+        self, asset: str, sources: tuple[str, ...], ts: float
+    ) -> _AsOfView:
+        """单次持锁原子采集历史时点判定所需的全部信息。
+
+        快照内各字段互相对应于同一个簿子状态，因此持续摄入新报价的同时
+        反复查询同一时点，拒绝明细与结论不会在请求之间漂移。
+        """
         with self._lock:
             quotes: dict[str, Quote | None] = {}
             pruned: list[str] = []
+            horizons: dict[str, float] = {}
+            observed = False
             for s in sources:
-                q, was_pruned = self.as_of(asset, s, ts)
-                quotes[s] = q
-                if was_pruned:
+                key = (asset, s)
+                earliest = self._earliest.get(key)
+                series = self._series.get(key)
+                if earliest is not None and earliest <= ts:
+                    observed = True
+                if earliest is None or ts < earliest:
+                    # 该时点之前从未见过此来源的报价（不是被清理）
+                    quotes[s] = None
+                    continue
+                if not series:
+                    # 曾有报价但序列已被全部清理
+                    quotes[s] = None
                     pruned.append(s)
-            return quotes, frozenset(pruned)
+                    continue
+                horizons[s] = series[0].ts
+                idx = bisect.bisect_right(series, ts, key=lambda q: q.ts) - 1
+                if idx >= 0:
+                    quotes[s] = series[idx]
+                else:
+                    # 曾有报价（最早观测 <= ts），但保留下来的都晚于 ts：已被清理
+                    quotes[s] = None
+                    pruned.append(s)
+
+            unconf: list[str] = []
+            for (a, s), series in self._series.items():
+                if a != asset or s in sources:
+                    continue
+                # 只统计 ts（含）之前已经到过的未配置来源，避免泄漏未来信息
+                if series and series[0].ts <= ts:
+                    unconf.append(s)
+                if self._earliest.get((a, s)) is not None and self._earliest[(a, s)] <= ts:
+                    observed = True
+
+            return _AsOfView(
+                quotes=quotes,
+                pruned=frozenset(pruned),
+                unconfigured=frozenset(unconf),
+                observed=observed,
+                horizons=horizons,
+            )
 
     def sources_for(self, asset: str) -> tuple[str, ...]:
         """该资产当前簿子里出现过的全部来源。"""
@@ -186,12 +254,26 @@ class PriceAggregator:
         """产出过去某时点的聚合价格（只读，不改动任何状态）。
 
         判定口径与 evaluate 完全一致，但只使用 ts 时点（含）之前已存在的
-        报价，绝不使用更晚的报价（不泄漏未来信息）；有效来源不足时同样
-        抛 InsufficientValidSources，绝不拿更早或更晚的价格顶替。
-        该时点之前没有报价(missing)与报价已被清理(pruned)是两种可区分的拒绝。
+        报价，绝不使用更晚的报价（不泄漏未来信息），从不拿更早或更晚的价格
+        顶替。三种失败彼此独立、可单独识别：
+        - PriceHistoryPruned：配置来源中确曾有报价但已超出保留范围被清理
+          （HTTP 410，独立 error_code）；边界含等号——ts 恰好等于仍保留的
+          最早一条报价时该报价可用，只有更早才判超出保留范围；
+        - InsufficientValidSources：在保留范围内，但当时来源不足/全部被拒
+          （missing/expired/non_positive/outlier）；
+        - NoPriceObservation：该资产在该时点之前从未收到过任何报价。
         """
-        snap, pruned = self._book.as_of_snapshot(config.asset, config.sources, ts)
-        return self._evaluate_snapshot(config, snap, pruned, ts, label="evaluate_as_of")
+        view = self._book.as_of_view(config.asset, config.sources, ts)
+        return self._evaluate_snapshot(
+            config,
+            view.quotes,
+            view.pruned,
+            ts,
+            label="evaluate_as_of",
+            unconfigured=view.unconfigured,
+            observed=view.observed,
+            horizons=view.horizons,
+        )
 
     def _evaluate_snapshot(
         self,
@@ -200,6 +282,9 @@ class PriceAggregator:
         pruned: frozenset[str],
         now: float,
         label: str,
+        unconfigured: frozenset[str] | None = None,
+        observed: bool | None = None,
+        horizons: dict[str, float] | None = None,
     ) -> AggregationResult:
         """对一份报价快照执行统一判定管线。
 
@@ -209,6 +294,7 @@ class PriceAggregator:
         3. 非正数
         4. 离群（相对候选中位数偏离超阈值）
         5. 剩余有效来源数 < min_valid_sources -> 资产不可用
+           历史路径上若存在 pruned 来源，优先抛 PriceHistoryPruned。
         """
         asset = config.asset
 
@@ -229,12 +315,12 @@ class PriceAggregator:
             candidates.append(q)
 
         # 未配置来源：记录但不参与聚合
-        configured = set(config.sources)
-        for source in self._book.sources_for(asset):
-            if source not in configured:
-                rejected.append(
-                    _UnconfiguredSource(source, "来源未在该资产配置中, 不参与聚合")
-                )
+        if unconfigured is None:
+            unconfigured = frozenset(self._book.sources_for(asset)) - set(config.sources)
+        for source in sorted(unconfigured):
+            rejected.append(
+                _UnconfiguredSource(source, "来源未在该资产配置中, 不参与聚合")
+            )
 
         fresh: list[Quote] = []
         # 2) 过期
@@ -286,7 +372,16 @@ class PriceAggregator:
 
         # 5) 有效来源不足
         if len(valid) < config.min_valid_sources:
-            if not self._book.has_any(asset):
+            if observed is None:
+                observed = self._book.has_any(asset)
+            # 历史路径上有来源曾报过价但已被清理：这是"超出保留范围"，
+            # 独立于"当时来源不足"，结论稳定（pruned 集合在原子快照中确定）
+            if pruned:
+                horizon = min(horizons.values()) if horizons else None
+                raise PriceHistoryPruned(
+                    asset, now, horizon, rejected, len(valid), config.min_valid_sources
+                )
+            if not observed:
                 raise NoPriceObservation(asset)
             raise InsufficientValidSources(
                 asset, len(valid), config.min_valid_sources, rejected
@@ -314,10 +409,10 @@ class PriceAggregator:
     def try_evaluate_as_of(
         self, config: AssetConfig, ts: float
     ) -> AggregationResult | None:
-        """同 evaluate_as_of，但无观测或有效来源不足时返回 None。"""
+        """同 evaluate_as_of，但无观测/超出保留范围/有效来源不足时返回 None。"""
         try:
             return self.evaluate_as_of(config, ts)
-        except (InsufficientValidSources, NoPriceObservation):
+        except (InsufficientValidSources, NoPriceObservation, PriceHistoryPruned):
             return None
 
 

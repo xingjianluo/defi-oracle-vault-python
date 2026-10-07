@@ -94,6 +94,44 @@ class QuotePruned(QuoteRejected):
         super().__init__(source, f"历史报价已超出保留范围被清理({detail})")
 
 
+class PriceHistoryPruned(PriceFeedError):
+    """历史时点早于报价保留范围：配置来源中确曾有报价，但已被滚动清理。
+
+    这是与以下两种结论**相互独立、可单独识别**的失败：
+    - InsufficientValidSources：查询时点在保留范围内，但当时来源不足/全部被拒；
+    - NoPriceObservation：该资产（或该来源）从来没有收到过报价。
+
+    判定边界稳定：查询时点 == 仍保留的最早一条报价的 ts 时该报价可用；
+    只有早于该边界才会得到本结论（含查询时点恰好落在已被清理的报价上）。
+    """
+
+    def __init__(
+        self,
+        asset: str,
+        ts: float,
+        horizon: float | None,
+        rejected: list[QuoteRejected],
+        valid: int,
+        required: int,
+    ) -> None:
+        self.asset = asset
+        self.ts = ts
+        # 还能回看的最早边界（配置来源中仍保留的最早报价 ts）；None 表示已无保留报价
+        self.horizon = horizon
+        self.rejected = rejected
+        self.valid = valid
+        self.required = required
+        self.pruned_sources = tuple(
+            r.source for r in rejected if isinstance(r, QuotePruned)
+        )
+        reasons = "; ".join(f"{r.source}:{r.reason}" for r in rejected)
+        super().__init__(
+            f"资产 {asset!r} 在 ts={ts} 的历史报价已超出保留范围"
+            f"(可回看边界 horizon={horizon}, 被清理来源={list(self.pruned_sources)}); "
+            f"有效来源 {valid}/{required}; 拒绝明细=[{reasons}]"
+        )
+
+
 # ---- 估值相关 ----
 
 

@@ -13,6 +13,7 @@ from defi_oracle_vault.errors import (
     InvalidTimestamp,
     LedgerHistoryPruned,
     NoPriceObservation,
+    PriceHistoryPruned,
     QuoteExpired,
     QuotePruned,
 )
@@ -98,6 +99,53 @@ def test_retention_count_cap():
     assert q is None and pruned
 
 
+def test_retention_boundary_decisive():
+    """正好卡在还能回看的最早边界：边界及之后给确定结论，只有更早才判超出保留范围。"""
+    book = PriceBook(HistoryRetention(max_age_seconds=100.0, max_entries_per_source=None))
+    agg = PriceAggregator(book)
+    cfg = make_cfg(sources=("s1",), min_valid_sources=1, max_age_seconds=1000.0)
+    book.ingest(Quote("BTC", "s1", D("100"), 0.0))
+    book.ingest(Quote("BTC", "s1", D("120"), 100.0))  # cutoff=0：ts=0 恰好保留
+    book.ingest(Quote("BTC", "s1", D("140"), 200.0))  # cutoff=100：ts=0 被清理，ts=100 恰好保留
+
+    # 边界 ts=100（== 仍保留的最早报价）：正常用上那条报价，不是 pruned
+    r = agg.evaluate_as_of(cfg, 100.0)
+    assert r.price == D("120")
+    # 边界之后也正常
+    assert agg.evaluate_as_of(cfg, 150.0).price == D("120")
+    # 早于边界 0.001 -> 超出保留范围，horizon 确定为 100
+    with pytest.raises(PriceHistoryPruned) as ei:
+        agg.evaluate_as_of(cfg, 99.999)
+    assert ei.value.horizon == 100.0
+    assert ei.value.pruned_sources == ("s1",)
+    # 同一时点反复查结论完全一致
+    for _ in range(5):
+        with pytest.raises(PriceHistoryPruned) as ei2:
+            agg.evaluate_as_of(cfg, 50.0)
+        assert ei2.value.horizon == 100.0
+        assert [type(r).__name__ for r in ei2.value.rejected] == ["QuotePruned"]
+
+
+def test_partial_pruned_still_independent_failure():
+    """部分来源超出保留范围、其余当时也没报价：结论仍是独立的 PriceHistoryPruned，明细可区分。"""
+    book = PriceBook(HistoryRetention(max_age_seconds=100.0, max_entries_per_source=None))
+    agg = PriceAggregator(book)
+    cfg = make_cfg(sources=("s1", "s2"), min_valid_sources=2, max_age_seconds=1000.0)
+    book.ingest(Quote("BTC", "s1", D("100"), 0.0))
+    book.ingest(Quote("BTC", "s1", D("100"), 500.0))  # s1 的 ts=0 被清理
+    # s2 从未报价
+    with pytest.raises(PriceHistoryPruned) as ei:
+        agg.evaluate_as_of(cfg, 400.0)
+    by_source = {r.source: type(r).__name__ for r in ei.value.rejected}
+    assert by_source == {"s1": "QuotePruned", "s2": "QuoteMissing"}
+    assert ei.value.pruned_sources == ("s1",)
+    # 只要有效来源已足够，部分来源被清理不影响得出聚合价（失败明细仍可见）
+    cfg_one = make_cfg(sources=("s1", "s2"), min_valid_sources=1, max_age_seconds=1000.0)
+    book.ingest(Quote("BTC", "s2", D("100"), 500.0))
+    r = agg.evaluate_as_of(cfg_one, 500.0)
+    assert r.price == D("100") and set(r.used_sources) == {"s1", "s2"}
+
+
 def test_as_of_exact_quote_timestamp():
     """查询时点恰好等于某条报价的 ts：该报价可用（含等号）。"""
     book = PriceBook(HistoryRetention(max_age_seconds=None, max_entries_per_source=None))
@@ -129,7 +177,7 @@ def test_no_future_leak(caplog):
 
 
 def test_missing_vs_pruned_distinguishable():
-    """"当时无报价"(missing)、"已被清理"(pruned)、"从无观测" 三种结论可区分。"""
+    """三种结论可区分："超出保留范围"是独立异常/错误码，区别于"当时无报价"与"从无观测"。"""
     book = PriceBook(HistoryRetention(max_age_seconds=100.0, max_entries_per_source=None))
     agg = PriceAggregator(book)
     cfg = make_cfg(max_age_seconds=1000.0)
@@ -139,15 +187,45 @@ def test_missing_vs_pruned_distinguishable():
     book.ingest(Quote("BTC", "s1", D("101"), 500.0))
     book.ingest(Quote("BTC", "s2", D("101"), 500.0))  # ts=0 的报价被清理
 
-    # ts=400：s1/s2 的旧报价已被清理 -> pruned；s3 从无报价 -> missing
-    with pytest.raises(InsufficientValidSources) as ei:
+    # ts=400：s1/s2 的旧报价已被清理 -> 独立异常 PriceHistoryPruned（不是笼统的不足）
+    with pytest.raises(PriceHistoryPruned) as ei:
         agg.evaluate_as_of(cfg, 400.0)
-    by_source = {r.source: r for r in ei.value.rejected}
+    exc = ei.value
+    # 可回看边界 = 仍保留的最早一条报价 ts=500；400 早于边界
+    assert exc.horizon == 500.0 and exc.ts == 400.0
+    assert exc.pruned_sources == ("s1", "s2")
+    by_source = {r.source: r for r in exc.rejected}
     assert isinstance(by_source["s1"], QuotePruned)
     assert isinstance(by_source["s2"], QuotePruned)
+    # 同一次失败里仍能看出 s3 是"当时还没有报价"，而不是被清理
     assert type(by_source["s3"]).__name__ == "QuoteMissing"
 
-    # 从无观测的资产：NoPriceObservation（与"曾被清理"不同）
+    # 从未发生清理时，早于首条报价的查询是"当时无报价"（QuoteMissing），不是超出保留范围
+    book2 = PriceBook(HistoryRetention(max_age_seconds=None, max_entries_per_source=None))
+    agg2 = PriceAggregator(book2)
+    book2.ingest(Quote("BTC", "s1", D("100"), 0.0))
+    book2.ingest(Quote("BTC", "s2", D("100"), 0.0))
+    # s3 从未报价；ts=400 时 s1/s2 有报价但已过期 -> InsufficientValidSources（保留范围内）
+    with pytest.raises(InsufficientValidSources) as ei:
+        agg2.evaluate_as_of(make_cfg(max_age_seconds=10.0), 400.0)
+    by_source = {type(r).__name__ for r in ei.value.rejected}
+    assert by_source == {"QuoteExpired", "QuoteMissing"}
+
+    # 资产在查询时点之前从未收到过任何报价 -> NoPriceObservation（独立第三种）
+    book3 = PriceBook(HistoryRetention(max_age_seconds=None, max_entries_per_source=None))
+    agg3 = PriceAggregator(book3)
+    book3.ingest(Quote("BTC", "s1", D("100"), 500.0))  # 报价晚于查询时点
+    with pytest.raises(NoPriceObservation):
+        agg3.evaluate_as_of(cfg, 400.0)
+
+    # 首条报价晚于查询时点：该时点之前从未收到报价 -> NoPriceObservation（不是 pruned）
+    book3 = PriceBook(HistoryRetention(max_age_seconds=None, max_entries_per_source=None))
+    agg3 = PriceAggregator(book3)
+    book3.ingest(Quote("BTC", "s1", D("100"), 500.0))
+    with pytest.raises(NoPriceObservation):
+        agg3.evaluate_as_of(cfg, 400.0)
+
+    # 完全从无观测的资产：NoPriceObservation（与"曾被清理"不同）
     with pytest.raises(NoPriceObservation):
         agg.evaluate_as_of(make_cfg(asset="ETH"), 400.0)
 
@@ -256,6 +334,28 @@ def test_position_at_replay_and_no_position(caplog):
     v = svc.position_at("carol", "BTC", 10.0, now=1000.0)
     assert v["has_position"] is False
     assert "position_at" in caplog.text and "alice" in caplog.text
+
+
+def test_position_history_pruned_independent_error():
+    """持仓回放路径同样独立上报"超出保留范围"，与"当时无持仓/无报价"区分。"""
+    svc = make_svc(HistoryRetention(max_age_seconds=5.0, max_entries_per_source=None))
+    feed(svc, {"s1": "100", "s2": "100"}, 0.0)
+    feed(svc, {"s1": "120", "s2": "120"}, 10.0)  # ts=0 报价被清理
+    svc.deposit("alice", "BTC", "2", now=10.0)
+    # ts=7 超出保留范围：410 类独立错误，而不是持仓为 0
+    before = svc.risk.status("BTC")
+    for _ in range(3):
+        with pytest.raises(PriceHistoryPruned) as ei:
+            svc.position_at("alice", "BTC", 7.0, now=1000.0)
+        assert ei.value.pruned_sources == ("s1", "s2")
+    # 历史失败不产生任何副作用：熔断状态/观察样本、账本均未被触碰
+    after = svc.risk.status("BTC")
+    assert after.state == before.state
+    assert after.last_good_ts == before.last_good_ts == 10.0  # 只来自存款时的实时估值
+    assert svc.ledger.balance_of("BTC", "alice") == D("2")
+    # 边界 ts=10 仍可正常回放
+    v = svc.position_at("alice", "BTC", 10.0, now=1000.0)
+    assert v["nav"] == D("120") and v["shares"] == D("2")
 
 
 def test_position_unavailable_vs_no_position_distinguishable():
@@ -379,6 +479,60 @@ def test_concurrent_writes_and_historical_queries():
     assert reconcile_ok and all(reconcile_ok)
 
 
+def test_concurrent_pruned_conclusion_stable():
+    """滚动清理不断推进时，并发反复查同一超界时点：异常类型/horizon/拒绝明细恒定。"""
+    svc = make_svc(HistoryRetention(max_age_seconds=10.0, max_entries_per_source=None))
+    feed(svc, {"s1": "100", "s2": "101"}, 0.0)
+
+    seen: set[tuple] = set()
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def writer():
+        i = 0
+        while not stop.is_set():
+            i += 1
+            # 时间不断前进，保留窗口把更早的报价持续清理掉
+            feed(svc, {"s1": str(100 + i % 5), "s2": str(101 + i % 5)}, 100.0 + i)
+
+    def reader():
+        while not stop.is_set():
+            try:
+                svc.price_of_at("BTC", 0.0, now=10**12)
+                errors.append(AssertionError("超出保留范围的时点不应成功"))
+                return
+            except PriceHistoryPruned as e:
+                # 结论的可复现要素：异常类型固定、被清理来源固定、拒绝明细固定
+                seen.add(
+                    (
+                        tuple(sorted(e.pruned_sources)),
+                        tuple(
+                            sorted(
+                                (r.source, type(r).__name__) for r in e.rejected
+                            )
+                        ),
+                    )
+                )
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+                return
+
+    threads = [threading.Thread(target=writer)] + [
+        threading.Thread(target=reader) for _ in range(4)
+    ]
+    for t in threads:
+        t.start()
+    threading.Event().wait(1.0)
+    stop.set()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    # horizon 会随写入推进，但"超出保留范围"这一结论及其判定依据恒定不变
+    assert seen == {(("s1", "s2"), (("s1", "QuotePruned"), ("s2", "QuotePruned"),
+                                    ("s3", "QuoteMissing")))}
+
+
 # ---- HTTP 层 ----
 
 
@@ -422,11 +576,14 @@ def test_history_endpoints(client):
     r = c.get("/assets/BTC/price/history", params={"ts": 10.0})
     assert r.status_code == 200 and r.json()["price"] == "110"
 
-    # ts=7：旧报价已被清理 -> 503，拒绝明细 reason=QuotePruned（可区分）
+    # ts=7：旧报价已被清理 -> 410 + 独立 error_code=PriceHistoryPruned（可单独识别）
     r = c.get("/assets/BTC/price/history", params={"ts": 7.0})
-    assert r.status_code == 503
+    assert r.status_code == 410
     body = r.json()
-    assert body["error_code"] == "InsufficientValidSources"
+    assert body["error_code"] == "PriceHistoryPruned"
+    assert body["query_ts"] == 7.0
+    assert body["horizon"] == 10.0  # 还能回看的最早边界
+    assert set(body["pruned_sources"]) == {"s1", "s2"}
     assert {x["reason"] for x in body["rejected"]} == {"QuotePruned"}
 
     # 非法时间点：负数/未来/非数值 -> 422，error_code 可区分
